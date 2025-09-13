@@ -1,0 +1,33 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install backend dependencies",
+			"type": "shell",
+			"command": "pip install fastapi uvicorn pymongo pydantic bson; echo Installed",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Seed MongoDB",
+			"type": "shell",
+			"command": "python seed_db.py",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Install pymongo only",
+			"type": "shell",
+			"command": "pip install pymongo; echo pymongo installed",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Seed MongoDB retry",
+			"type": "shell",
+			"command": "python seed_db.py",
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
