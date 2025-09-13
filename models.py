@@ -86,9 +86,14 @@ class ParkingSession(MongoBase):
 	gate_id: Optional[str] = None
 	started_at: datetime
 	ended_at: Optional[datetime] = None
+	planned_end_at: Optional[datetime] = None
 	open: bool = True
 	cost: Optional[float] = None
 	paid: bool = False
+	ticket_id: Optional[str] = None
+	qr_version: Optional[str] = None
+	qr_raw: Optional[dict] = None
+	last_scanned_at: Optional[datetime] = None
 
 
 class QueryLog(MongoBase):
