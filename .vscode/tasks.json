@@ -28,6 +28,13 @@
 			"command": "python seed_db.py",
 			"problemMatcher": [],
 			"group": "build"
+		},
+		{
+			"label": "Run backend (dev)",
+			"type": "shell",
+			"command": "uvicorn main:app --reload",
+			"isBackground": true,
+			"group": "build"
 		}
 	]
 }

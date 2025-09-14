@@ -1,17 +1,24 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+try:
+    # Pydantic v2 config
+    from pydantic import ConfigDict  # type: ignore
+except Exception:
+    ConfigDict = None  # type: ignore
 from datetime import datetime, timedelta
 from ai_assistant import ParkingAssistant
 import stripe
-from db import get_collections, ensure_indexes, ensure_validators
+from db import get_collections, ensure_indexes, ensure_validators, get_db
 from bson import ObjectId
 from typing import Optional
+from typing import List
 
 app = FastAPI()
 
 # Initialize the AI assistant
 ai_assistant = ParkingAssistant()
+ai_assistant.db = get_db()
 
 # Ensure DB schema and indexes
 try:
@@ -79,9 +86,193 @@ class QRPayload(BaseModel):
     entryTimeHuman: Optional[str] = Field(default=None, alias='entry-time')  # e.g., 13-09-2025
     carTypeHyphen: Optional[str] = Field(default=None, alias='car-type')     # e.g., c | car
 
-    class Config:
-        allow_population_by_field_name = True
+    # Pydantic v2 style config; fallback left for v1
+    if ConfigDict is not None:
+        model_config = ConfigDict(populate_by_name=True)
+    else:
+        class Config:  # type: ignore
+            allow_population_by_field_name = True
     # Future fields can be added here; unknowns ignored on store
+class ExitAttemptRequest(BaseModel):
+    vrn: str
+    gate_name: Optional[str] = None
+
+
+class VRNSearchRequest(BaseModel):
+    vrn: Optional[str] = None
+    entry_time_from: Optional[str] = None
+    entry_time_to: Optional[str] = None
+    limit: int = 10
+
+
+class VRNUpdateRequest(BaseModel):
+    session_id: Optional[str] = None
+    ticket_id: Optional[str] = None
+    old_vrn: Optional[str] = None
+    new_vrn: str
+
+
+class BarrierControlRequest(BaseModel):
+    action: str  # 'allow' | 'deny'
+    gate_name: Optional[str] = None
+
+
+class MessageLogRequest(BaseModel):
+    session_id: str
+    user_input: Optional[str] = None
+    ai_response: Optional[str] = None
+    intent: Optional[str] = None
+    confidence: Optional[float] = None
+    metadata: Optional[dict] = None
+    timestamp: Optional[str] = None  # ISO 8601
+
+
+def _fuzzy_score(a: str, b: str) -> int:
+    # Simple Levenshtein distance
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    return dp[m][n]
+
+
+@app.post("/api/exit/attempt")
+async def exit_attempt(payload: ExitAttemptRequest):
+    cols = get_collections()
+    vrn = payload.vrn.strip().upper()
+    # Find vehicle
+    vehicle = cols["vehicles"].find_one({"plate": vrn})
+    if not vehicle:
+        return {"success": False, "status": "vrn_not_found"}
+    vid = str(vehicle.get("_id"))
+    # Prefer ongoing open, else open session
+    ongoing = cols["ongoing_processes"].find_one({"vehicle_id": vid, "open": True})
+    sess = None
+    if not ongoing:
+        sess = cols["parking_sessions"].find_one({"vehicle_id": vid, "open": True})
+    src = ongoing or sess
+    if not src:
+        # No active session - allow crossing (some ticketless systems allow exit)
+        return {"success": True, "status": "allowed", "reason": "no_active_session", "session": None}
+    # Check payment
+    if src.get("paid") or not src.get("open", True):
+        return {"success": True, "status": "allowed", "session": {
+            "session_id": src.get("session_id") or src.get("ticket_id"),
+            "entry_time": (src.get("started_at").isoformat() if src.get("started_at") else None),
+            "plate": vrn,
+            "payment_amount": int((src.get("cost") or 0.0) * 100),
+        }}
+    # If unpaid, return payment required
+    return {"success": True, "status": "payment_required", "session": {
+        "session_id": src.get("session_id") or src.get("ticket_id"),
+        "entry_time": (src.get("started_at").isoformat() if src.get("started_at") else None),
+        "plate": vrn,
+    }}
+
+
+@app.post("/api/vrn/search")
+async def vrn_search(payload: VRNSearchRequest):
+    cols = get_collections()
+    vrn = (payload.vrn or "").strip().upper()
+    # Collect candidate open sessions (ongoing + sessions)
+    candidates: List[dict] = []
+    candidates.extend(list(cols["ongoing_processes"].find({"open": True})))
+    candidates.extend(list(cols["parking_sessions"].find({"open": True})))
+    # Filter by entry time if provided
+    def within_time(doc: dict) -> bool:
+        if not payload.entry_time_from and not payload.entry_time_to:
+            return True
+        try:
+            st = doc.get("started_at")
+            if not st:
+                return False
+            if isinstance(st, str):
+                st = datetime.fromisoformat(st)
+            if payload.entry_time_from:
+                if st < datetime.fromisoformat(payload.entry_time_from):
+                    return False
+            if payload.entry_time_to:
+                if st > datetime.fromisoformat(payload.entry_time_to):
+                    return False
+            return True
+        except Exception:
+            return False
+    candidates = [c for c in candidates if within_time(c)]
+    # Score by VRN similarity
+    results = []
+    for c in candidates:
+        # resolve plate
+        plate = None
+        if c.get("plate"):
+            plate = c["plate"].upper()
+        else:
+            veh = cols["vehicles"].find_one({"_id": ObjectId(c.get("vehicle_id"))}) if c.get("vehicle_id") else None
+            if veh:
+                plate = str(veh.get("plate", "")).upper()
+        if not plate:
+            continue
+        score = _fuzzy_score(vrn, plate) if vrn else 0
+        results.append({
+            "session_id": c.get("session_id") or c.get("ticket_id"),
+            "plate": plate,
+            "entry_time": (c.get("started_at").isoformat() if c.get("started_at") else None),
+            "open": bool(c.get("open", True)),
+            "paid": bool(c.get("paid", False)),
+            "score": score,
+        })
+    results.sort(key=lambda r: r["score"])  # lower distance is better
+    return {"success": True, "results": results[: max(1, int(payload.limit))]}
+
+
+@app.post("/api/vrn/update")
+async def vrn_update(payload: VRNUpdateRequest):
+    cols = get_collections()
+    if not payload.new_vrn:
+        raise HTTPException(status_code=400, detail="new_vrn required")
+    new_plate = payload.new_vrn.strip().upper()
+    # Ensure vehicle exists for new VRN
+    vehicle = cols["vehicles"].find_one({"plate": new_plate})
+    if not vehicle:
+        vehicle_id = str(cols["vehicles"].insert_one({"plate": new_plate}).inserted_id)
+    else:
+        vehicle_id = str(vehicle["_id"])
+    # Build query to locate session/ongoing
+    q = {}
+    if payload.session_id:
+        q["session_id"] = payload.session_id
+    if payload.ticket_id:
+        q["ticket_id"] = payload.ticket_id
+    if not q:
+        raise HTTPException(status_code=400, detail="Provide session_id or ticket_id")
+    updated = 0
+    for colname in ["ongoing_processes", "parking_sessions"]:
+        r = cols[colname].update_many(q, {"$set": {"plate": new_plate, "vehicle_id": vehicle_id}})
+        updated += r.modified_count
+    return {"success": True, "updated": int(updated)}
+
+
+@app.post("/api/barrier/control")
+async def barrier_control(payload: BarrierControlRequest):
+    # In a real system this would signal hardware; here we return success
+    if payload.action not in {"allow", "deny"}:
+        raise HTTPException(status_code=400, detail="Invalid action")
+    return {"success": True, "action": payload.action, "gate": payload.gate_name}
+
+
+@app.get("/api/anpr/live")
+async def anpr_live(vrn: Optional[str] = None):
+    # Simulate ANPR camera feed status
+    return {"success": True, "vrn": (vrn or None), "camera": "EXIT_CAM_1", "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.post("/api/transcribe")
@@ -241,46 +432,33 @@ async def start_session(payload: StartSessionRequest):
         else:
             gate_id = str(gate.get("_id"))
 
-    # Close any stale open session for same plate (safety)
-    cols["parking_sessions"].update_many({"vehicle_id": vehicle_id, "open": True}, {"$set": {"open": False, "ended_at": datetime.utcnow()}})
-    # Mark any ongoing processes for same vehicle as completed
-    try:
-        cols["ongoing_processes"].update_many({"vehicle_id": vehicle_id, "status": "ongoing"}, {"$set": {"status": "completed", "ended_at": datetime.utcnow(), "updated_at": datetime.utcnow()}})
-    except Exception:
-        pass
-
-    started_at = datetime.fromisoformat(payload.started_at) if payload.started_at else datetime.utcnow()
-    sess_doc = {
+    # Create or update an ongoing process record (do not finalize into parking_sessions yet)
+    now = datetime.utcnow()
+    started_at = datetime.fromisoformat(payload.started_at) if payload.started_at else now
+    # Session id: prefer provided ticket id; else synthesize one
+    session_id = (payload.ticket_id or f"SESS-{plate}-{int(now.timestamp())}")
+    doc = {
+        "session_id": session_id,
+        "plate": plate,
         "vehicle_id": vehicle_id,
         "gate_id": gate_id,
         "ticket_id": payload.ticket_id,
         "started_at": started_at,
         "open": True,
         "paid": False,
+        "status": "open",
+        "last_scanned_at": now,
+        "source": "session_start",
     }
-    ins = cols["parking_sessions"].insert_one(sess_doc)
-    # Upsert ongoing process row
-    try:
-        now = datetime.utcnow()
-        cols["ongoing_processes"].update_one(
-            {"session_id": str(ins.inserted_id)},
-            {"$set": {
-                "session_id": str(ins.inserted_id),
-                "ticket_id": payload.ticket_id,
-                "vehicle_id": vehicle_id,
-                "plate": plate,
-                "gate_id": gate_id,
-                "started_at": datetime.fromisoformat(payload.started_at) if payload.started_at else now,
-                "last_scanned_at": now,
-                "status": "ongoing",
-                "created_at": now,
-                "updated_at": now,
-            }},
-            upsert=True,
-        )
-    except Exception:
-        pass
-    return {"success": True, "session_db_id": str(ins.inserted_id)}
+    query = {"ticket_id": payload.ticket_id} if payload.ticket_id else {"vehicle_id": vehicle_id, "open": True}
+    existing = cols["ongoing_processes"].find_one(query)
+    if existing:
+        cols["ongoing_processes"].update_one({"_id": existing["_id"]}, {"$set": doc})
+        oid = existing["_id"]
+    else:
+        ins = cols["ongoing_processes"].insert_one(doc)
+        oid = ins.inserted_id
+    return {"success": True, "ongoing_id": str(oid)}
 
 
 @app.post("/api/qr/ingest")
@@ -306,15 +484,21 @@ async def ingest_qr(payload: QRPayload):
             gate_id = str(gate_res.inserted_id)
         else:
             gate_id = str(gate["_id"])
-    # Find existing open session by ticket or by vehicle
-    sess = None
+    # Prefer ongoing process first
+    ongoing = None
     if data.get("ticketId"):
+        ongoing = cols["ongoing_processes"].find_one({"ticket_id": data["ticketId"], "open": True})
+    if not ongoing:
+        ongoing = cols["ongoing_processes"].find_one({"vehicle_id": vehicle_id, "open": True})
+    # Back-compat: open session if no ongoing exists
+    sess = None
+    if not ongoing and data.get("ticketId"):
         sess = cols["parking_sessions"].find_one({"ticket_id": data["ticketId"], "open": True})
-    if not sess:
+    if not ongoing and not sess:
         sess = cols["parking_sessions"].find_one({"vehicle_id": vehicle_id, "open": True})
     now = datetime.utcnow()
-    if not sess:
-        # Start new session from QR
+    if not ongoing and not sess:
+        # Start new ongoing from QR
         started_at = now
         if data.get("issuedAt"):
             try:
@@ -323,82 +507,46 @@ async def ingest_qr(payload: QRPayload):
                 started_at = now
         # Generate ticket id if missing
         ticket_id = data.get("ticketId") or f"TKT-{data['plate']}-{int(now.timestamp())}"
+        session_id = ticket_id
         doc = {
+            "session_id": session_id,
+            "plate": plate,
             "vehicle_id": vehicle_id,
             "gate_id": gate_id,
             "ticket_id": ticket_id,
             "started_at": started_at,
             "open": True,
             "paid": False,
+            "status": "open",
             "qr_version": data["version"],
             "qr_raw": data,
             "last_scanned_at": now,
         }
-        ins = cols["parking_sessions"].insert_one(doc)
-        sess = cols["parking_sessions"].find_one({"_id": ins.inserted_id})
-        # Clear any older ongoing entries for same vehicle
-        try:
-            cols["ongoing_processes"].update_many({"vehicle_id": vehicle_id, "session_id": {"$ne": str(ins.inserted_id)}, "status": "ongoing"}, {"$set": {"status": "completed", "ended_at": now, "updated_at": now}})
-            cols["ongoing_processes"].delete_many({"vehicle_id": vehicle_id, "session_id": {"$ne": str(ins.inserted_id)}})
-        except Exception:
-            pass
-        # Upsert ongoing process entry
-        try:
-            cols["ongoing_processes"].update_one(
-                {"session_id": str(ins.inserted_id)},
-                {"$set": {
-                    "session_id": str(ins.inserted_id),
-                    "ticket_id": ticket_id,
-                    "vehicle_id": vehicle_id,
-                    "plate": plate,
-                    "gate_id": gate_id,
-                    "started_at": started_at,
-                    "last_scanned_at": now,
-                    "qr_version": data["version"],
-                    "qr_raw": data,
-                    "status": "ongoing",
-                    "created_at": now,
-                    "updated_at": now,
-                }},
-                upsert=True,
-            )
-        except Exception as _:
-            pass
+        ins = cols["ongoing_processes"].insert_one(doc)
+        ongoing = cols["ongoing_processes"].find_one({"_id": ins.inserted_id})
     else:
-        # Update existing session with latest QR info
+        # Update existing ongoing or session with latest QR info
         update_doc = {
-            "gate_id": gate_id or sess.get("gate_id"),
-            "ticket_id": data.get("ticketId") or sess.get("ticket_id"),
+            "gate_id": gate_id or (sess.get("gate_id") if sess else None),
+            "ticket_id": data.get("ticketId") or (sess.get("ticket_id") if sess else None),
+            "plate": plate,
+            "status": "open",
             "qr_version": data["version"],
             "qr_raw": data,
             "last_scanned_at": now,
         }
-        cols["parking_sessions"].update_one({"_id": sess["_id"]}, {"$set": update_doc})
-        sess = cols["parking_sessions"].find_one({"_id": sess["_id"]})
-        # Sync ongoing process entry
-        try:
-            cols["ongoing_processes"].update_one(
-                {"session_id": str(sess["_id"])},
-                {"$set": {
-                    "ticket_id": sess.get("ticket_id"),
-                    "vehicle_id": sess.get("vehicle_id"),
-                    "plate": plate,
-                    "gate_id": sess.get("gate_id"),
-                    "last_scanned_at": now,
-                    "qr_version": data["version"],
-                    "qr_raw": data,
-                    "status": "ongoing",
-                    "updated_at": now,
-                }},
-                upsert=True,
-            )
-        except Exception as _:
-            pass
+        if ongoing:
+            cols["ongoing_processes"].update_one({"_id": ongoing["_id"]}, {"$set": update_doc})
+            ongoing = cols["ongoing_processes"].find_one({"_id": ongoing["_id"]})
+        elif sess:
+            cols["parking_sessions"].update_one({"_id": sess["_id"]}, {"$set": update_doc})
+            sess = cols["parking_sessions"].find_one({"_id": sess["_id"]})
 
     # Compute amount due based on up-to-date session & pricing
-    started_at = sess["started_at"]
-    gate_id = sess.get("gate_id")
-    veh = cols["vehicles"].find_one({"_id": ObjectId(sess["vehicle_id"])}) if sess.get("vehicle_id") else None
+    source_doc = ongoing or sess
+    started_at = source_doc["started_at"]
+    gate_id = source_doc.get("gate_id")
+    veh = cols["vehicles"].find_one({"_id": ObjectId(source_doc["vehicle_id"])}) if source_doc.get("vehicle_id") else None
     vtype = (veh or {}).get("vehicle_type") or "car"
     pr = cols["prices"].find_one({"gate_id": gate_id}) if gate_id else None
     per_hour = 2.0
@@ -413,26 +561,31 @@ async def ingest_qr(payload: QRPayload):
     amount_cents = _compute_amount_due_cents(started_at, per_hour=per_hour, max_daily=max_daily)
     return {
         "success": True,
-        "session_id": str(sess["_id"]),
-        "ticket_id": sess.get("ticket_id"),
+        "session_id": str(source_doc["_id"]),
+        "ticket_id": source_doc.get("ticket_id"),
         "vehicle_type": vtype,
         "per_hour": per_hour,
         "amount_cents": amount_cents,
-        "open": bool(sess.get("open", True)),
-        "paid": bool(sess.get("paid", False)),
-        "started_at": (sess.get("started_at").isoformat() if sess.get("started_at") else None),
+        "open": bool(source_doc.get("open", True)),
+        "paid": bool(source_doc.get("paid", False)),
+        "started_at": (source_doc.get("started_at").isoformat() if source_doc.get("started_at") else None),
     }
 
 
 @app.post("/api/session/extend")
 async def extend_session(payload: ExtendSessionRequest):
     cols = get_collections()
-    sess = cols["parking_sessions"].find_one({"ticket_id": payload.ticket_id, "open": True})
-    if not sess:
+    # Prefer ongoing process if present
+    ongoing = cols["ongoing_processes"].find_one({"ticket_id": payload.ticket_id, "open": True})
+    sess = None
+    if not ongoing:
+        sess = cols["parking_sessions"].find_one({"ticket_id": payload.ticket_id, "open": True})
+    if not ongoing and not sess:
         raise HTTPException(status_code=404, detail="Open session not found for ticket")
     # Compute new planned end time
     now = datetime.utcnow()
-    planned_end = sess.get("planned_end_at") or now
+    src = ongoing or sess
+    planned_end = src.get("planned_end_at") or now
     if isinstance(planned_end, str):
         try:
             planned_end = datetime.fromisoformat(planned_end)
@@ -441,25 +594,27 @@ async def extend_session(payload: ExtendSessionRequest):
     if planned_end < now:
         planned_end = now
     new_planned_end = planned_end + timedelta(minutes=int(max(1, payload.extra_minutes)))
-    cols["parking_sessions"].update_one({"_id": sess["_id"]}, {"$set": {"planned_end_at": new_planned_end}})
-    # Touch ongoing process update time
-    try:
-        cols["ongoing_processes"].update_one({"session_id": str(sess["_id"])}, {"$set": {"updated_at": datetime.utcnow()}})
-    except Exception:
-        pass
+    if ongoing:
+        cols["ongoing_processes"].update_one({"_id": ongoing["_id"]}, {"$set": {"planned_end_at": new_planned_end}})
+    else:
+        cols["parking_sessions"].update_one({"_id": sess["_id"]}, {"$set": {"planned_end_at": new_planned_end}})
     return {"success": True, "planned_end_at": new_planned_end.isoformat()}
 
 
 @app.get("/api/session/{ticket_id}/amount-due")
 async def get_amount_due(ticket_id: str):
     cols = get_collections()
-    sess = cols["parking_sessions"].find_one({"ticket_id": ticket_id, "open": True})
-    if not sess:
+    ongoing = cols["ongoing_processes"].find_one({"ticket_id": ticket_id, "open": True})
+    sess = None
+    if not ongoing:
+        sess = cols["parking_sessions"].find_one({"ticket_id": ticket_id, "open": True})
+    src = ongoing or sess
+    if not src:
         raise HTTPException(status_code=404, detail="Open session not found for ticket")
-    started_at = sess["started_at"]
-    gate_id = sess.get("gate_id")
+    started_at = src["started_at"]
+    gate_id = src.get("gate_id")
     # Resolve vehicle type
-    veh = cols["vehicles"].find_one({"_id": ObjectId(sess["vehicle_id"])}) if sess.get("vehicle_id") else None
+    veh = cols["vehicles"].find_one({"_id": ObjectId(src["vehicle_id"])}) if src.get("vehicle_id") else None
     vtype = (veh or {}).get("vehicle_type") or "car"
     # Load pricing for gate
     pr = cols["prices"].find_one({"gate_id": gate_id}) if gate_id else None
@@ -490,16 +645,20 @@ async def mark_session_paid(payload: PaymentSuccessRequest):
         query["open"] = True
     else:
         raise HTTPException(status_code=400, detail="Provide session_db_id or ticket_id")
-
-    sess = cols["parking_sessions"].find_one(query)
-    if not sess:
+    # Prefer ongoing
+    ongoing = cols["ongoing_processes"].find_one(query)
+    sess = None
+    if not ongoing:
+        sess = cols["parking_sessions"].find_one(query)
+    if not ongoing and not sess:
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Compute final cost and close session
-    started_at = sess["started_at"]
+    src = ongoing or sess
+    started_at = src["started_at"]
     # Use same pricing resolution as amount-due
-    gate_id = sess.get("gate_id")
-    veh = cols["vehicles"].find_one({"_id": ObjectId(sess["vehicle_id"])}) if sess.get("vehicle_id") else None
+    gate_id = src.get("gate_id")
+    veh = cols["vehicles"].find_one({"_id": ObjectId(src["vehicle_id"])}) if src.get("vehicle_id") else None
     vtype = (veh or {}).get("vehicle_type") or "car"
     pr = cols["prices"].find_one({"gate_id": gate_id}) if gate_id else None
     per_hour = 2.0
@@ -512,18 +671,30 @@ async def mark_session_paid(payload: PaymentSuccessRequest):
         if pr.get("max_daily") is not None:
             max_daily = float(pr.get("max_daily"))
     amount_cents = _compute_amount_due_cents(started_at, per_hour=per_hour, max_daily=max_daily)
-    cols["parking_sessions"].update_one({"_id": sess["_id"]}, {"$set": {
-        "paid": True,
-        "open": False,
-        "ended_at": datetime.utcnow(),
-        "cost": amount_cents / 100.0,
-    }})
-    # Mark ongoing process as completed
-    try:
-        cols["ongoing_processes"].delete_one({"session_id": str(sess["_id"])})
-    except Exception as _:
-        pass
-    return {"success": True, "final_amount_cents": amount_cents}
+    if ongoing:
+        # Move ongoing into parking_sessions as finalized record
+        now = datetime.utcnow()
+        move_doc = {k: v for k, v in ongoing.items() if k != "_id"}
+        move_doc.update({
+            "paid": True,
+            "open": False,
+            "ended_at": now,
+            "cost": amount_cents / 100.0,
+            "finalized_from": "ongoing_processes",
+            "status": "paid",
+        })
+        ins = cols["parking_sessions"].insert_one(move_doc)
+        cols["ongoing_processes"].delete_one({"_id": ongoing["_id"]})
+        return {"success": True, "final_amount_cents": amount_cents, "session_db_id": str(ins.inserted_id)}
+    else:
+        cols["parking_sessions"].update_one({"_id": src["_id"]}, {"$set": {
+            "paid": True,
+            "open": False,
+            "ended_at": datetime.utcnow(),
+            "cost": amount_cents / 100.0,
+            "status": "paid",
+        }})
+        return {"success": True, "final_amount_cents": amount_cents, "session_db_id": str(src["_id"]) }
 
 
 @app.get("/api/sessions/{session_id}/history")
@@ -559,6 +730,50 @@ async def get_session_history(session_id: str):
     }
 
 
+@app.post("/api/messages/log")
+async def log_message(payload: MessageLogRequest):
+    """Persist a conversation message (user and/or assistant) into MongoDB.
+
+    This is used by the frontend which runs the AI locally (Puter SDK) to still
+    record transcripts server-side for history and analytics.
+    """
+    db = ai_assistant.db
+    if not payload.session_id or not isinstance(payload.session_id, str):
+        raise HTTPException(status_code=400, detail="session_id is required")
+    # Parse timestamp or default to now (UTC)
+    ts = datetime.utcnow()
+    if payload.timestamp:
+        try:
+            # Support both Z and timezone-less formats
+            iso = payload.timestamp.replace('Z', '+00:00')
+            ts_parsed = datetime.fromisoformat(iso)
+            # Store naive UTC
+            ts = ts_parsed if ts_parsed.tzinfo is None else ts_parsed.replace(tzinfo=None)
+        except Exception:
+            pass
+
+    # Coerce types and provide defaults to satisfy collection validator
+    user_input = "" if payload.user_input is None else str(payload.user_input)
+    ai_response = "" if payload.ai_response is None else str(payload.ai_response)
+    intent = payload.intent if payload.intent is not None else "unknown"
+    try:
+        confidence = float(payload.confidence) if payload.confidence is not None else 0.0
+    except Exception:
+        confidence = 0.0
+
+    doc = {
+        "session_id": payload.session_id,
+        "timestamp": ts,
+        "user_input": user_input,
+        "ai_response": ai_response,
+        "intent": intent,
+        "confidence": confidence,
+        "metadata": payload.metadata or {},
+    }
+    res = db["messages"].insert_one(doc)
+    return {"success": True, "id": str(res.inserted_id)}
+
+
 @app.delete("/api/sessions/{session_id}")
 async def clear_session(session_id: str):
     """Clear a conversation session"""
@@ -577,25 +792,6 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "active_sessions": len(ai_assistant.sessions)
     }
-
-
-@app.get("/api/ongoing")
-async def list_ongoing():
-    """List ongoing processes (dev/debug)."""
-    cols = get_collections()
-    docs = list(cols["ongoing_processes"].find({}).sort("updated_at", -1))
-    def _fmt(d):
-        return {
-            "session_id": str(d.get("session_id")),
-            "ticket_id": d.get("ticket_id"),
-            "plate": d.get("plate"),
-            "status": d.get("status"),
-            "started_at": d.get("started_at").isoformat() if d.get("started_at") else None,
-            "ended_at": d.get("ended_at").isoformat() if d.get("ended_at") else None,
-            "updated_at": d.get("updated_at").isoformat() if d.get("updated_at") else None,
-            "gate_id": d.get("gate_id"),
-        }
-    return {"count": len(docs), "items": [_fmt(x) for x in docs]}
 
 
 if __name__ == "__main__":
